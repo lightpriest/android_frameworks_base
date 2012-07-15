@@ -18,8 +18,10 @@
 package com.android.internal.policy.impl;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.ActivityManagerNative;
 import android.app.ActivityManager.RunningAppProcessInfo;
+import android.app.ActivityManager.RecentTaskInfo;
 import android.app.IActivityManager;
 import android.app.IUiModeManager;
 import android.app.ProgressDialog;
@@ -492,6 +494,16 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     private boolean mPowerKeyTriggered;
     private long mPowerKeyTime;
 
+    // Quickswitch trigger states
+    private static final long QUICK_SWITCH_RECENT_TASKS_FORGET = 10000;
+    private boolean mQuickSwitchUpTriggered;
+    private boolean mQuickSwitchDownTriggered;
+    private long mQuickSwitchChordTime;
+    private long mQuickSwitchTasksTime;
+    private int mQuickSwitchCurrentTask;
+    private List<RecentTaskInfo> mQuickSwitchTasks;
+    private boolean mQuickSwitchTasksClear = false;
+
     ShortcutManager mShortcutManager;
     PowerManager.WakeLock mBroadcastWakeLock;
 
@@ -718,6 +730,115 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         }
     }
 
+    // Perform a quick task switch, up or down. Keys must be "tapped"
+    private void interceptQuickSwitchChord(boolean up) {
+
+        final long now = SystemClock.uptimeMillis();
+
+        if (!mVolumeDownKeyTriggered && mPowerKeyTriggered && mVolumeUpKeyTriggered) {
+            if (now <= mVolumeUpKeyTime + ACTION_CHORD_DEBOUNCE_DELAY_MILLIS
+                    && now <= mPowerKeyTime + ACTION_CHORD_DEBOUNCE_DELAY_MILLIS) {
+                // We should consume the volume up key and cancel power key action
+                mVolumeUpKeyConsumedByChord = true;
+                cancelPendingPowerKeyAction();
+
+                mQuickSwitchUpTriggered = true;
+                mQuickSwitchDownTriggered = false;
+                mQuickSwitchChordTime = SystemClock.uptimeMillis();
+                return;
+            }
+        }
+
+        if (mVolumeDownKeyTriggered && mPowerKeyTriggered && !mVolumeUpKeyTriggered) {
+            if (now <= mVolumeDownKeyTime + ACTION_CHORD_DEBOUNCE_DELAY_MILLIS
+                    && now <= mPowerKeyTime + ACTION_CHORD_DEBOUNCE_DELAY_MILLIS) {
+                // interceptScreenshotChord consumes volume down key and power in this situation
+
+                mQuickSwitchUpTriggered = false;
+                mQuickSwitchDownTriggered = true;
+                mQuickSwitchChordTime = SystemClock.uptimeMillis();
+                return;
+            }
+        }
+
+        if (up && (mQuickSwitchUpTriggered || mQuickSwitchDownTriggered) && now <= mQuickSwitchChordTime + ACTION_CHORD_DEBOUNCE_DELAY_MILLIS + 300) {
+            IActivityManager am = ActivityManagerNative.getDefault();
+            List<RecentTaskInfo> tasks;
+
+            boolean doSwitch = false;
+            boolean skipSwitch = false;
+            boolean fromHome = false;
+            boolean sameSize = false;
+
+            try {
+                tasks = am.getRecentTasks(50, ActivityManager.RECENT_IGNORE_UNAVAILABLE);
+
+                if (tasks.size() <= 1) { // Considering home application
+                    skipSwitch = true;
+                } else if (!mQuickSwitchTasksClear && mQuickSwitchTasks != null && mQuickSwitchTasks.size() + 1 == tasks.size()) {
+                    sameSize = true;
+                } else {
+                    for (int i = 0; i < tasks.size(); i++) {
+                        RecentTaskInfo task = tasks.get(i);
+                        if (task.baseIntent.getAction() == Intent.ACTION_MAIN
+                            && task.baseIntent.hasCategory(Intent.CATEGORY_HOME)) {
+                            tasks.remove(task);
+                            if (i == 0) {
+                                fromHome = true;
+                                doSwitch = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            } catch (RemoteException re) {
+                mQuickSwitchUpTriggered = false;
+                mQuickSwitchDownTriggered = false;
+                return;
+            }
+
+            mQuickSwitchTasksClear = false;
+
+            if (!skipSwitch) {
+                if (fromHome || mQuickSwitchTasks == null
+                        || now >= mQuickSwitchTasksTime + QUICK_SWITCH_RECENT_TASKS_FORGET
+                        || !sameSize) {
+                    mQuickSwitchTasks = tasks;
+                    mQuickSwitchCurrentTask = 0;
+                }
+
+                mQuickSwitchTasksTime = now;
+
+                if (!fromHome && mQuickSwitchUpTriggered) {
+                    if (mQuickSwitchCurrentTask + 1 < mQuickSwitchTasks.size()) {
+                        mQuickSwitchCurrentTask += 1;
+                        doSwitch = true;
+                    }
+                }
+
+                if (!fromHome && mQuickSwitchDownTriggered) {
+                    if (mQuickSwitchCurrentTask > 0) {
+                        mQuickSwitchCurrentTask -= 1;
+                        doSwitch = true;
+                    }
+                }
+            }
+
+            if (!skipSwitch && doSwitch) {
+                try {
+                    am.moveTaskToFront(mQuickSwitchTasks.get(mQuickSwitchCurrentTask).id, 0);
+                } catch (RemoteException re) {
+                }
+                // mContext.startActivity(mQuickSwitchTasks.get(mQuickSwitchCurrentTask).baseIntent);
+            } else {
+                performHapticFeedbackLw(null, HapticFeedbackConstants.LONG_PRESS, false);
+            }
+
+            mQuickSwitchUpTriggered = false;
+            mQuickSwitchDownTriggered = false;
+        }
+    }
+
     private void cancelPendingScreenshotChordAction() {
         mHandler.removeCallbacks(mScreenshotChordLongPress);
     }
@@ -862,6 +983,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
             showOrHideRecentAppsDialog(RECENT_APPS_BEHAVIOR_SHOW_OR_DISMISS);
         } else if (mLongPressOnHomeBehavior == LONG_PRESS_HOME_RECENT_SYSTEM_UI) {
             try {
+                mQuickSwitchTasksClear = true;
                 mStatusBarService.toggleRecentApps();
             } catch (RemoteException e) {
                 Slog.e(TAG, "RemoteException when showing recent apps", e);
@@ -3000,6 +3122,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     @Override
     public int interceptKeyBeforeQueueing(KeyEvent event, int policyFlags, boolean isScreenOn) {
         final boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
+        final boolean up = event.getAction() == KeyEvent.ACTION_UP;
         final boolean canceled = event.isCanceled();
         int keyCode = event.getKeyCode();
 
@@ -3106,11 +3229,15 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                             cancelPendingPowerKeyAction();
                             interceptScreenshotChord();
                             interceptRingerChord();
+                            interceptQuickSwitchChord(up);
                         }
                     } else {
                         mVolumeDownKeyTriggered = false;
                         cancelPendingScreenshotChordAction();
                         cancelPendingRingerChordAction();
+                        if (up && isScreenOn && (event.getFlags() & KeyEvent.FLAG_FALLBACK) == 0) {
+                            interceptQuickSwitchChord(up);
+                        }
                     }
                 } else if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
                     if (down) {
@@ -3122,11 +3249,15 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                             cancelPendingPowerKeyAction();
                             cancelPendingScreenshotChordAction();
                             interceptRingerChord();
+                            interceptQuickSwitchChord(up);
                         }
                     } else {
                         mVolumeUpKeyTriggered = false;
                         cancelPendingScreenshotChordAction();
                         cancelPendingRingerChordAction();
+                        if (up && isScreenOn && (event.getFlags() & KeyEvent.FLAG_FALLBACK) == 0) {
+                            interceptQuickSwitchChord(up);
+                        }
                     }
                 }
                 if (down) {
@@ -3205,6 +3336,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                         mPowerKeyTime = event.getDownTime();
                         cancelPendingRingerChordAction();
                         interceptScreenshotChord();
+                        interceptQuickSwitchChord(up);
                     }
 
                     ITelephony telephonyService = getTelephonyService();
@@ -3231,6 +3363,9 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 } else {
                     mPowerKeyTriggered = false;
                     cancelPendingScreenshotChordAction();
+                    if (up && isScreenOn && (event.getFlags() & KeyEvent.FLAG_FALLBACK) == 0) {
+                        interceptQuickSwitchChord(up);
+                    }
                     if (interceptPowerKeyUp(canceled || mPendingPowerKeyUpCanceled)) {
                         result = (result & ~ACTION_POKE_USER_ACTIVITY) | ACTION_GO_TO_SLEEP;
                     }
